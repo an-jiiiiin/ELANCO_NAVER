@@ -148,7 +148,7 @@ def get_window(now_kst: datetime):
     (직전 발송 시각과 겹치지 않도록 1분 버퍼)
     """
     today_9am = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
-    window_start = (today_9am - timedelta(days=1)) + timedelta(minutes=1)  # 전일 09:01
+    window_start = (today_9am - timedelta(days=10)) + timedelta(minutes=1)
     return window_start, today_9am
 
 
