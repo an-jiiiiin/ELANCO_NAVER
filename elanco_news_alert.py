@@ -20,6 +20,12 @@ CBRE 뉴스 알림(cbre_news_alert.py)과 동일한 구조이며, 차이점은 �
 수정하면 됩니다. key가 메일에 표시되는 섹션 제목이고, value(리스트)가 해당
 섹션에서 검색할 키워드들입니다. 같은 섹션 안의 키워드로 찾은 기사는 모두
 합쳐서 중복 제거한 뒤 하나의 섹션으로 표시됩니다.
+
+네이버 뉴스 검색 API는 형태소 단위로 매칭하기 때문에, 예를 들어 "넥스가드"를
+검색해도 기사 어딘가에 "넥스"와 "가드"가 따로 떨어져 있기만 해도 검색 결과에
+걸릴 수 있습니다. 이를 막기 위해 검색 결과로 받은 기사마다 실제로 키워드가
+붙어서(연속된 문자열로) 등장하는지 제목/요약 → 기사 본문 순으로 다시 확인하고,
+그렇지 않으면(형태소만 분리되어 매칭된 오탐이면) 결과에서 제외합니다.
 """
 
 import os
@@ -185,6 +191,11 @@ def fetch_naver_news(client_id: str, client_secret: str, query: str):
         batch = data.get("items", [])
         if not batch:
             break
+        for it in batch:
+            # 이 기사를 찾아낸 검색 키워드를 기록해둡니다. 나중에
+            # filter_and_dedupe에서 이 키워드가 실제로 붙어서 등장하는지
+            # 재검증할 때 사용합니다.
+            it["_query"] = query
         items.extend(batch)
         # 이미 가져온 마지막 기사가 필터 시작 시각보다 이전이면 더 가져올 필요 없음(최신순이므로)
         last_pubdate = parse_pubdate(batch[-1]["pubDate"])
@@ -322,10 +333,25 @@ REPORTER_EXTRACTORS = (
 )
 
 
-def get_reporter_name(item: dict) -> str:
-    """기사 페이지에서 기자 이름을 추출합니다. 신뢰도가 높은 방법부터 차례로
-    시도하고, 모두 실패하면(또는 사람 이름 같지 않으면) 빈 문자열을 반환합니다.
-    언론사 사이트 구조가 제각각이라 100% 정확하지는 않으며 참고용입니다."""
+def check_keyword_and_get_reporter(item: dict, keyword: str):
+    """기사 원문에서 (1) 검색 키워드가 실제로 붙어서(연속된 문자열로) 등장하는지,
+    (2) 기자 이름을 함께 확인합니다.
+
+    네이버 뉴스 검색 API는 형태소 단위로 매칭하기 때문에 "넥스가드"를 검색해도
+    기사 안에 "넥스"와 "가드"가 따로 떨어져 있기만 해도 결과에 걸릴 수 있습니다.
+    이를 걸러내기 위해 제목+요약을 먼저 확인하고, 거기 없으면 기사 본문까지
+    확인해서 keyword 문자열이 실제로 붙어있는 경우에만 True를 반환합니다.
+    기자 이름 조회는 기존 로직과 동일하며, 어차피 같은 페이지를 열어야 하므로
+    키워드 검증과 같은 요청에서 함께 처리해 불필요한 중복 요청을 줄입니다.
+    """
+    has_keyword = not keyword  # 키워드 정보가 없으면(예외 상황) 검증을 건너뜀
+    reporter = ""
+
+    if keyword:
+        combined = strip_tags((item.get("title", "") or "") + " " + (item.get("description", "") or ""))
+        if keyword in combined:
+            has_keyword = True
+
     link = item.get("link") or ""
     originallink = item.get("originallink") or ""
 
@@ -338,6 +364,9 @@ def get_reporter_name(item: dict) -> str:
         candidates.append(link)
 
     for url in candidates:
+        if has_keyword and reporter:
+            break  # 둘 다 확인됐으면 더 이상 페이지를 열어볼 필요 없음
+
         try:
             resp = requests.get(url, headers=REQUEST_HEADERS, timeout=8)
             resp.raise_for_status()
@@ -347,12 +376,18 @@ def get_reporter_name(item: dict) -> str:
             time.sleep(0.15)  # 대상 사이트에 대한 과도한 요청 방지
 
         html = resp.text
-        for extractor in REPORTER_EXTRACTORS:
-            name = extractor(html)
-            if name:
-                return name
 
-    return ""
+        if not has_keyword and keyword and keyword in strip_tags(html):
+            has_keyword = True
+
+        if not reporter:
+            for extractor in REPORTER_EXTRACTORS:
+                name = extractor(html)
+                if name:
+                    reporter = name
+                    break
+
+    return has_keyword, reporter
 
 
 def filter_and_dedupe(items, window_start, window_end):
@@ -365,6 +400,13 @@ def filter_and_dedupe(items, window_start, window_end):
         link = item.get("link") or item.get("originallink")
         if link in seen_links:
             continue
+
+        keyword = item.get("_query", "")
+        has_keyword, reporter = check_keyword_and_get_reporter(item, keyword)
+        if not has_keyword:
+            # 검색 키워드가 형태소만 분리되어 매칭된 오탐 기사 → 결과에서 제외
+            continue
+
         seen_links.add(link)
         filtered.append(
             {
@@ -372,7 +414,7 @@ def filter_and_dedupe(items, window_start, window_end):
                 "link": link,
                 "originallink": item.get("originallink", ""),
                 "press": get_press_name(item),
-                "reporter": get_reporter_name(item),
+                "reporter": reporter,
                 "pubdate": pub,
                 "description": strip_tags(item.get("description", "")),
             }
