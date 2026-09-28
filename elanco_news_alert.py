@@ -55,6 +55,7 @@ QUERY_GROUPS = {
     "크레델리오": ["크레델리오", "크레델리오플러스"],
     "넥스가드": ["넥스가드", "넥스가드스펙트라"],
     "심파리카": ["심파리카", "심파리카트리오", "심패리카", "심패리카트리오"],
+    "젠네리아": ["젠네리아"],
 }
 
 KST = timezone(timedelta(hours=9))
@@ -213,6 +214,10 @@ PRESS_NAME_MAP = {
 
     # 부동산/건설/에너지/산업 전문지
     "dnews.co.kr": "대한경제",
+    "fntimes.com": "한국금융신문",
+    "m-i.kr": "매일일보",
+    "asiatoday.co.kr": "아시아투데이",
+    "skyedaily.com": "스카이데일리",
     "ikld.kr": "국토일보",
     "conslove.co.kr": "한국건설신문",
     "hapt.co.kr": "한국아파트신문",
@@ -506,6 +511,8 @@ NAME_BLACKLIST = {
     "여적", "사설", "만평", "만물상", "특파원", "온라인뉴스", "디지털뉴스",
     "편집국", "취재팀", "뉴스룸", "데스크", "종합", "속보", "단독",
     "인터뷰", "포토", "영상", "그래픽", "카드뉴스", "지면보기", "기자수첩",
+    "산업부", "경제부", "사회부", "정치부", "국제부", "건설부", "부동산부",
+    "담당", "사진", "영상기자", "취재", "해당", "선임", "수습", "객원",
 }
 
 
@@ -520,28 +527,90 @@ def is_plausible_reporter_name(name: str) -> bool:
     return True
 
 
-def _extract_json_ld_author(html: str) -> str:
-    """schema.org NewsArticle 구조화 데이터(JSON-LD)의 author.name 사용.
-    네이버뉴스를 포함한 대부분의 정식 언론사 CMS가 이 표준 태그를
-    페이지당 한 번(해당 기사 전용으로) 넣기 때문에, 사이드바/관련기사
-    위젯에서 엉뚱한 이름을 주워올 위험이 거의 없어 가장 신뢰도가 높다."""
-    for m in re.finditer(r'"author"\s*:\s*(\[?\s*\{.*?\})', html, re.S):
-        name_m = re.search(r'"name"\s*:\s*"([^"]{1,20})"', m.group(1))
-        if name_m and is_plausible_reporter_name(name_m.group(1)):
-            return name_m.group(1).strip()
+def _clean_reporter_text(raw: str) -> str:
+    """'최소망 기자', '김철수·이영희 기자', '홍길동 기자 (hong@news1.kr)' → 첫 번째 이름만."""
+    text = strip_tags(raw or "")
+    text = re.sub(r"[\w.+-]+@[\w.-]+", " ", text)          # 이메일 제거
+    text = re.sub(r"\(.*?\)|\[.*?\]", " ", text)           # 괄호 제거
+    text = re.sub(r"선임기자|수습기자|객원기자|기자|특파원", " ", text)
+    for part in re.split(r"[·,/\s]+", text):
+        if is_plausible_reporter_name(part):
+            return part.strip()
     return ""
+
+
+def _remove_photo_captions(html: str) -> str:
+    """사진 캡션·사진 출처 영역을 제거한다.
+
+    2026-09 수정: 뉴스1 등은 본문 사진 캡션 끝에 '/뉴스1 © News1 이동원 기자'처럼
+    '사진 찍은 기자' 이름을 붙인다. 이 캡션이 본문 첫머리에 오기 때문에,
+    본문에서 'OOO 기자'를 찾으면 실제 작성 기자 대신 사진기자가 걸렸다.
+    네이버 캡션 태그(img_desc, end_photo_org 등)를 통째로 지우고,
+    '© 뉴스1 OOO 기자' 같은 출처 표기도 텍스트에서 제거한다."""
+    html = re.sub(r'<em[^>]*class="[^"]*img_desc[^"]*"[^>]*>[\s\S]*?</em>', " ", html, flags=re.I)
+    html = re.sub(r'<(span|div|p|figcaption)[^>]*class="[^"]*(end_photo_org|photo|caption|img_desc)[^"]*"[^>]*>[\s\S]*?</\1>',
+                  " ", html, flags=re.I)
+    html = re.sub(r"<figcaption[\s\S]*?</figcaption>", " ", html, flags=re.I)
+    return html
+
+
+def _remove_caption_credits(text: str) -> str:
+    """텍스트로 남은 사진 출처 표기 제거: '/뉴스1 © News1 이동원 기자', '(사진=홍길동 기자)' 등."""
+    text = re.sub(r"©\s*\S+\s*[가-힣]{2,4}\s*기자", " ", text)
+    text = re.sub(r"/\s*[가-힣A-Za-z0-9]+\s*[가-힣]{2,4}\s*기자", " ", text)
+    text = re.sub(r"(사진|촬영|영상)\s*[=:]\s*[가-힣]{2,4}\s*기자", " ", text)
+    text = re.sub(r"[가-힣]{2,4}\s*기자\s*(촬영|제공)", " ", text)
+    return text
+
+
+def _article_body_text(html: str) -> str:
+    """기사 본문 텍스트만. 네이버는 id="dic_area" 이후만 사용(구독·랭킹·관련기사 배제),
+    사진 캡션과 사진 출처 표기는 제거한다."""
+    idx = html.find('id="dic_area"')
+    body = html[idx:] if idx != -1 else html
+    body = re.sub(r"<head[\s\S]*?</head>", "", body, flags=re.I)
+    body = re.sub(r"<script[\s\S]*?</script>", "", body, flags=re.I)
+    body = re.sub(r"<style[\s\S]*?</style>", "", body, flags=re.I)
+    body = _remove_photo_captions(body)
+    return _remove_caption_credits(strip_tags(body))
 
 
 def _extract_naver_head_journalist(html: str) -> str:
-    """네이버뉴스 기사 헤더의 기자명 영역. 페이지 안에 같은 클래스가 여러 번
-    (관련기사 카드 등) 나올 수 있어, 기사 제목 영역(media_end_head_headline)
-    '이후'로 검색 범위를 한정해 실제 기사 작성자를 찾을 확률을 높인다."""
+    """네이버뉴스 제목 아래 기자명('최소망 기자'). '기자'가 붙어 있으므로 정리 후 판정."""
     anchor = html.find("media_end_head_headline")
     area = html[anchor:] if anchor != -1 else html
-    m = re.search(r'media_end_head_journalist_name">\s*([^<]+?)\s*<', area)
-    if m and is_plausible_reporter_name(m.group(1)):
-        return m.group(1).strip()
+    m = re.search(r'class="[^"]*media_end_head_journalist_name[^"]*"[^>]*>(.*?)</', area, re.S)
+    return _clean_reporter_text(m.group(1)) if m else ""
+
+
+def _extract_naver_bottom_byline(html: str) -> str:
+    """네이버뉴스 본문 하단 바이라인('최소망 기자 (xxx@news1.kr)')."""
+    m = re.search(r'class="[^"]*byline_s[^"]*"[^>]*>(.*?)</', html, re.S)
+    return _clean_reporter_text(m.group(1)) if m else ""
+
+
+def _extract_json_ld_author(html: str) -> str:
+    """schema.org NewsArticle(또는 Article) JSON-LD 블록 안의 author.name만 사용."""
+    for script_m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.S | re.I,
+    ):
+        block = script_m.group(1)
+        if '"NewsArticle"' not in block and '"Article"' not in block:
+            continue
+        name_m = re.search(r'"author"\s*:\s*\[?\s*\{[^}]*?"name"\s*:\s*"([^"]{1,30})"', block, re.S)
+        if name_m:
+            name = _clean_reporter_text(name_m.group(1))
+            if name:
+                return name
     return ""
+
+
+def _extract_dateline_byline(html: str) -> str:
+    """본문 첫머리 표준 바이라인 '(서울=뉴스1) 최소망 기자 =' 패턴."""
+    head = _article_body_text(html)[:1500]
+    m = re.search(r"\([^()]{1,15}=[^()]{1,15}\)\s*([가-힣·,\s]{2,20}?)\s*(?:선임|수습)?\s*기자", head)
+    return _clean_reporter_text(m.group(1)) if m else ""
 
 
 def _extract_meta_author(html: str) -> str:
@@ -550,17 +619,12 @@ def _extract_meta_author(html: str) -> str:
         html,
         re.I,
     )
-    if not m:
-        return ""
-    candidate = re.sub(r"[\(\[].*?[\)\]]", "", m.group(1)).split(",")[0].strip()
-    candidate = re.sub(r"\s*기자\s*$", "", candidate).strip()
-    return candidate if is_plausible_reporter_name(candidate) else ""
+    return _clean_reporter_text(m.group(1)) if m else ""
 
 
 def _extract_cms_byline(html: str) -> str:
-    """'김태훈 (다른기사보기)' 처럼 일부 언론사 CMS가 쓰는 정형화된
-    작성자 표기 패턴."""
-    text = strip_tags(html)
+    """'김태훈 (다른기사보기)' 처럼 일부 언론사 CMS가 쓰는 작성자 표기 패턴."""
+    text = strip_tags(_remove_photo_captions(html))
     m = re.search(r"([가-힣]{2,4})\s*\(?\s*다른\s*기사\s*보기", text)
     if m and is_plausible_reporter_name(m.group(1)):
         return m.group(1).strip()
@@ -568,25 +632,23 @@ def _extract_cms_byline(html: str) -> str:
 
 
 def _extract_loose_byline(html: str) -> str:
-    """최후의 수단: <head>/<script>/<style>을 제거한 본문 텍스트에서
-    'OOO 기자' 패턴을 찾는다. 그래도 관련기사 위젯 등에서 오탐될 수 있으므로
-    블랙리스트로 걸러진 값만 채택한다."""
-    body = re.sub(r"<head[\s\S]*?</head>", "", html, flags=re.I)
-    body = re.sub(r"<script[\s\S]*?</script>", "", body, flags=re.I)
-    body = re.sub(r"<style[\s\S]*?</style>", "", body, flags=re.I)
-    text = strip_tags(body)
-    for m in re.finditer(r"([가-힣]{2,4})\s*기자(?!단|회|실)", text):
+    """최후의 수단. 사진 캡션을 뺀 기사 본문에서만 'OOO 기자'를 찾는다."""
+    text = _article_body_text(html)
+    for m in re.finditer(r"([가-힣]{2,4})\s*기자(?!단|회|실|들)", text):
         if is_plausible_reporter_name(m.group(1)):
             return m.group(1).strip()
     return ""
 
 
-REPORTER_EXTRACTORS = (
-    _extract_json_ld_author,
+# 정밀 추출기: 모든 후보 페이지(네이버 → 원문)에서 먼저 시도한다.
+# 네이버 제목 아래 기자명이 가장 정확하므로 1순위.
+STRICT_EXTRACTORS = (
     _extract_naver_head_journalist,
+    _extract_naver_bottom_byline,
+    _extract_json_ld_author,
+    _extract_dateline_byline,
     _extract_meta_author,
     _extract_cms_byline,
-    _extract_loose_byline,
 )
 
 
@@ -620,6 +682,7 @@ def check_keyword_and_get_reporter(item: dict, keyword: str):
     if link and link not in candidates:
         candidates.append(link)
 
+    fetched = []
     for url in candidates:
         if has_keyword and reporter:
             break  # 둘 다 확인됐으면 더 이상 페이지를 열어볼 필요 없음
@@ -633,16 +696,25 @@ def check_keyword_and_get_reporter(item: dict, keyword: str):
             time.sleep(0.15)  # 대상 사이트에 대한 과도한 요청 방지
 
         html = resp.text
+        fetched.append(html)
 
         if not has_keyword and keyword and keyword in strip_tags(html):
             has_keyword = True
 
         if not reporter:
-            for extractor in REPORTER_EXTRACTORS:
+            # 정밀 추출기만 먼저 시도 (사진 캡션·관련기사 오탐 방지)
+            for extractor in STRICT_EXTRACTORS:
                 name = extractor(html)
                 if name:
                     reporter = name
                     break
+
+    # 모든 페이지에서 정밀 추출이 실패했을 때만 본문 느슨한 추출
+    if not reporter:
+        for html in fetched:
+            reporter = _extract_loose_byline(html)
+            if reporter:
+                break
 
     return has_keyword, reporter
 
@@ -681,7 +753,7 @@ def filter_and_dedupe(items, window_start, window_end):
 
 
 def build_email_body(group_articles: dict, window_start, window_end) -> str:
-    # group_articles: {"크레델리오": [...], "넥스가드": [...], "심파리카": [...]}
+    # group_articles: {"크레델리오": [...], "넥스가드": [...], "심파리카": [...], "젠네리아": [...]}
     # 전체가 0건일 때는 main()에서 이 함수를 호출하기 전에 이미 메일 발송 자체를
     # 건너뛰므로, 여기서는 최소 1개 섹션에 1건 이상 있다고 가정합니다.
     total = sum(len(v) for v in group_articles.values())
